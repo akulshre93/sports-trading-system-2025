@@ -1,0 +1,28 @@
+# Security
+keys/
+*.pem
+
+# Logs  
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# IDE
+.vscode/
+.spyder*/
+
+# OS
+.DS_Store
+Thumbs.db
