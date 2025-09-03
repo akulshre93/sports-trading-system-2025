@@ -1,6 +1,6 @@
 -- =====================================================
 -- SPORTS TRADING SYSTEM 2.0 - DATABASE SCHEMA
--- Multi-strategy position and order tracking
+-- Multi-strategy position and order tracking (CORRECTED)
 -- =====================================================
 
 -- =====================================================
@@ -66,17 +66,15 @@ CREATE TABLE market_data_history (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     relative_min_to_game_start INTEGER, -- Positive = game running, Negative = game starts in X min
     
-    -- Performance indexes
-    INDEX idx_market_data_ticker_time (ticker, timestamp),
-    INDEX idx_market_data_relative_time (relative_min_to_game_start),
-    INDEX idx_market_data_sport_time (sport_id, timestamp)
+    -- Audit trail
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- =====================================================
 -- TRADING ACTIVITY
 -- =====================================================
 
--- Current positions - real-time position tracking
+-- Position snapshots - tracks position state over time
 CREATE TABLE positions (
     id SERIAL PRIMARY KEY,
     position_uuid UUID UNIQUE DEFAULT gen_random_uuid(), -- Our unique identifier
@@ -106,30 +104,25 @@ CREATE TABLE positions (
     stop_loss_price DECIMAL(4,2),
     take_profit_price DECIMAL(4,2),
     
-    -- Strategy context (inherited from orders)
+    -- Strategy context
     strategy_action VARCHAR(50), -- 'entry', 'exit', 'stop_loss', 'take_profit'
-    strategy_reason TEXT, -- Free text from strategy (e.g., 'momentum_detected', 'statistical_fade')
+    strategy_reason TEXT, -- Free text from strategy
     confidence_score DECIMAL(3,2), -- Strategy confidence 0.00-1.00
     notes TEXT,
     
+    -- Versioning for position snapshots
+    position_version INTEGER DEFAULT 1,
+    position_snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
     -- Audit trail
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Indexes for fast queries
-    INDEX idx_positions_strategy_ticker (strategy_id, ticker),
-    INDEX idx_positions_status (status),
-    INDEX idx_positions_entry_time (entry_time),
-    
-    -- Ensure one position per strategy per ticker
-    UNIQUE(strategy_id, ticker)
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- All orders placed (both filled and unfilled)
 CREATE TABLE orders (
     id SERIAL PRIMARY KEY,
     order_uuid UUID UNIQUE DEFAULT gen_random_uuid(),
-    position_id INTEGER REFERENCES positions(id), -- Links to position (NULL if position not created yet)
     strategy_id INTEGER REFERENCES strategies(id),
     ticker VARCHAR(100) NOT NULL,
     
@@ -156,11 +149,9 @@ CREATE TABLE orders (
     strategy_action VARCHAR(50) NOT NULL, -- 'entry', 'exit', 'stop_loss', 'take_profit'
     strategy_reason TEXT NOT NULL, -- Free text from strategy executor
     
-    -- Indexes
-    INDEX idx_orders_strategy_ticker (strategy_id, ticker),
-    INDEX idx_orders_status (status),
-    INDEX idx_orders_kalshi_id (kalshi_order_id),
-    INDEX idx_orders_placed_at (placed_at)
+    -- Audit trail
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- =====================================================
@@ -215,10 +206,7 @@ CREATE TABLE system_health (
     message TEXT,
     metric_name VARCHAR(50),
     metric_value DECIMAL(10,2),
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_health_component_time (component, timestamp),
-    INDEX idx_health_status (status)
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Market data collection health
@@ -234,20 +222,50 @@ CREATE TABLE data_collection_health (
 );
 
 -- =====================================================
+-- INDEXES (Created after tables)
+-- =====================================================
+
+-- Market data history indexes
+CREATE INDEX idx_market_data_ticker_time ON market_data_history (ticker, timestamp);
+CREATE INDEX idx_market_data_relative_time ON market_data_history (relative_min_to_game_start);
+CREATE INDEX idx_market_data_sport_time ON market_data_history (sport_id, timestamp);
+
+-- Position indexes
+CREATE INDEX idx_positions_latest ON positions (strategy_id, ticker, position_snapshot_time DESC);
+CREATE INDEX idx_positions_strategy_ticker ON positions (strategy_id, ticker);
+CREATE INDEX idx_positions_status ON positions (status);
+CREATE INDEX idx_positions_entry_time ON positions (entry_time);
+
+-- Order indexes
+CREATE INDEX idx_orders_strategy_ticker ON orders (strategy_id, ticker);
+CREATE INDEX idx_orders_status ON orders (status);
+CREATE INDEX idx_orders_kalshi_id ON orders (kalshi_order_id);
+CREATE INDEX idx_orders_placed_at ON orders (placed_at);
+
+-- System health indexes
+CREATE INDEX idx_health_component_time ON system_health (component, timestamp);
+CREATE INDEX idx_health_status ON system_health (status);
+
+-- =====================================================
 -- VIEWS FOR COMMON QUERIES
 -- =====================================================
 
--- Current portfolio summary
+-- Current portfolio summary (latest position snapshots only)
 CREATE VIEW portfolio_summary AS
 SELECT 
     s.name as strategy_name,
-    COUNT(p.id) as open_positions,
+    COUNT(DISTINCT p.ticker) as open_positions,
     SUM(p.market_exposure) as total_exposure_cents,
     SUM(p.realized_pnl) as total_realized_pnl_cents,
     SUM(p.fees_paid) as total_fees_paid_cents,
     AVG(p.confidence_score) as avg_confidence
 FROM strategies s
-LEFT JOIN positions p ON s.id = p.strategy_id AND p.status = 'open'
+LEFT JOIN LATERAL (
+    SELECT DISTINCT ON (p2.strategy_id, p2.ticker) *
+    FROM positions p2
+    WHERE p2.strategy_id = s.id AND p2.status = 'open'
+    ORDER BY p2.strategy_id, p2.ticker, p2.position_snapshot_time DESC
+) p ON true
 GROUP BY s.id, s.name;
 
 -- Recent performance by strategy
@@ -314,8 +332,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to update position from Kalshi API data
-CREATE OR REPLACE FUNCTION update_position_from_kalshi(
+-- Function to insert position snapshot from Kalshi API data
+CREATE OR REPLACE FUNCTION insert_position_snapshot(
     p_ticker VARCHAR(100),
     p_strategy_id INTEGER,
     p_kalshi_data JSONB
@@ -324,7 +342,8 @@ BEGIN
     INSERT INTO positions (
         strategy_id, ticker, event_ticker,
         total_traded, position, market_exposure, realized_pnl, 
-        resting_orders_count, fees_paid, kalshi_last_updated
+        resting_orders_count, fees_paid, kalshi_last_updated,
+        position_snapshot_time
     ) VALUES (
         p_strategy_id,
         p_ticker,
@@ -335,18 +354,27 @@ BEGIN
         (p_kalshi_data->>'realized_pnl')::INTEGER,
         (p_kalshi_data->>'resting_orders_count')::INTEGER,
         (p_kalshi_data->>'fees_paid')::INTEGER,
-        (p_kalshi_data->>'last_updated_ts')::TIMESTAMP
-    )
-    ON CONFLICT (strategy_id, ticker) 
-    DO UPDATE SET
-        total_traded = EXCLUDED.total_traded,
-        position = EXCLUDED.position,
-        market_exposure = EXCLUDED.market_exposure,
-        realized_pnl = EXCLUDED.realized_pnl,
-        resting_orders_count = EXCLUDED.resting_orders_count,
-        fees_paid = EXCLUDED.fees_paid,
-        kalshi_last_updated = EXCLUDED.kalshi_last_updated,
-        updated_at = CURRENT_TIMESTAMP;
+        (p_kalshi_data->>'last_updated_ts')::TIMESTAMP,
+        CURRENT_TIMESTAMP
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get latest position for strategy/ticker
+CREATE OR REPLACE FUNCTION get_latest_position(
+    p_strategy_id INTEGER,
+    p_ticker VARCHAR(100)
+) RETURNS positions AS $$
+DECLARE
+    latest_position positions%ROWTYPE;
+BEGIN
+    SELECT * INTO latest_position
+    FROM positions 
+    WHERE strategy_id = p_strategy_id AND ticker = p_ticker
+    ORDER BY position_snapshot_time DESC 
+    LIMIT 1;
+    
+    RETURN latest_position;
 END;
 $$ LANGUAGE plpgsql;
 
