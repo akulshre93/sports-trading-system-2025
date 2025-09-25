@@ -50,7 +50,7 @@ FAT_TAIL_CONFIG = {
     'strategy_type': 'BACKING',            # BACKING underdogs (not FADING favorites)
     'price_range_min': 0.32,               # 32¢ minimum underdog price
     'price_range_max': 0.46,               # 46¢ maximum underdog price  
-    'trading_window_start': -120,          # UPDATED: -120 minutes (was -20)
+    'trading_window_start': -200,          # UPDATED: -200 minutes (was -20)
     'trading_window_end': 4,               # +4 minutes into game
     
     # Validated performance metrics

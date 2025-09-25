@@ -15,19 +15,23 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from cryptography.hazmat.primitives import serialization
 
-# Import core components
+# FIXED VERSION:
 from core.api_client import ExchangeClient
 from core.database import DatabaseManager
-from core.logger import get_component_logger
 from configs.config_base import get_kalshi_config, get_system_config
-
+import logging
 
 class PositionMonitor:
     """Centralized position monitoring service with 1-second polling"""
     
     def __init__(self):
         # Initialize components
-        self.logger = get_component_logger('position_monitor')
+        self.logger = logging.getLogger('position_monitor')
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
         self.config = get_system_config()
         
         # API client initialization

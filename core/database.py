@@ -7,6 +7,7 @@ Integrates with: config_base.py, schema.sql functions, position monitoring
 
 import psycopg2
 from psycopg2 import pool
+#from psycopg2.pool import PoolExhausted  # Add this line
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from typing import Dict, Any, List, Optional, Tuple
@@ -53,6 +54,13 @@ class DatabaseManager:
                 password=self.config['password'],
                 connect_timeout=self.config['connection_timeout']
             )
+            
+            # SET ALL CONNECTIONS TO USE UTC TIMEZONE
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SET TIME ZONE 'UTC'")
+                    conn.commit()
+            
             print(f"Database pool initialized: {self.config['min_connections']}-{self.config['max_connections']} connections")
             
         except Exception as e:
@@ -68,11 +76,14 @@ class DatabaseManager:
         try:
             with self._pool_lock:
                 conn = self.pool.getconn()
+            
+            # FIXED: Set timezone for EVERY connection
+            with conn.cursor() as cur:
+                cur.execute("SET TIME ZONE 'UTC'")
+            
             yield conn
             
-        except psycopg2.PoolExhausted:
-            raise DatabaseError("Connection pool exhausted - too many concurrent operations")
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        except Exception as e:
             raise DatabaseError(f"Database connection error: {e}")
         finally:
             if conn:

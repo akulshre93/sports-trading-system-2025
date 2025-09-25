@@ -28,7 +28,9 @@ CREATE TABLE markets (
     close_time TIMESTAMP,
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_data_update TIMESTAMP,
+    consecutive_failures INTEGER DEFAULT 0
 );
 
 -- Strategies reference table (for foreign keys only - config in code)
@@ -61,6 +63,12 @@ CREATE TABLE market_data_history (
     yes_volume INTEGER DEFAULT 0,
     no_volume INTEGER DEFAULT 0,
     total_volume INTEGER DEFAULT 0,
+    
+    -- Market data (from Kalshi market API)
+    last_price DECIMAL(4,2),
+    volume_24h INTEGER DEFAULT 0,
+    liquidity INTEGER DEFAULT 0,
+    open_interest INTEGER DEFAULT 0,
     
     -- Timing context
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -154,6 +162,55 @@ CREATE TABLE orders (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Order request queue for shared order executor
+CREATE TABLE order_requests (
+    id SERIAL PRIMARY KEY,
+    request_uuid UUID UNIQUE DEFAULT gen_random_uuid(),
+    strategy_id INTEGER REFERENCES strategies(id) NOT NULL,
+    ticker VARCHAR(100) NOT NULL,
+    
+    -- Order specification
+    side VARCHAR(10) NOT NULL, -- 'yes', 'no'
+    action VARCHAR(10) NOT NULL, -- 'buy', 'sell'
+    order_type VARCHAR(20) NOT NULL, -- 'limit', 'market'
+    quantity INTEGER NOT NULL,
+    price DECIMAL(4,2), -- NULL for market orders
+    
+    -- Strategy context
+    strategy_action VARCHAR(50) NOT NULL, -- 'entry', 'exit', 'stop_loss', 'take_profit'
+    strategy_reason TEXT NOT NULL,
+    priority INTEGER DEFAULT 5, -- 1=highest, 10=lowest
+    
+    -- Request lifecycle
+    status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'processing', 'placed', 'rejected', 'cancelled'
+    rejection_reason TEXT,
+    cancellation_reason TEXT,
+    
+    -- Execution tracking
+    kalshi_order_id VARCHAR(100), -- Set when successfully placed
+    placed_at TIMESTAMP,
+    filled_at TIMESTAMP,
+    cancelled_at TIMESTAMP,
+    processed_at TIMESTAMP,
+    processing_duration_ms INTEGER, -- Time from pending to placed/rejected
+    
+    -- Conflict detection fields
+    conflicts_with_existing_position BOOLEAN DEFAULT FALSE,
+    conflicts_with_pending_order BOOLEAN DEFAULT FALSE,
+    conflict_details JSONB,
+    
+    -- Audit trail
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Constraints
+    CONSTRAINT valid_side CHECK (side IN ('yes', 'no')),
+    CONSTRAINT valid_action CHECK (action IN ('buy', 'sell')),
+    CONSTRAINT valid_order_type CHECK (order_type IN ('limit', 'market')),
+    CONSTRAINT valid_status CHECK (status IN ('pending', 'processing', 'placed', 'rejected', 'cancelled')),
+    CONSTRAINT limit_orders_need_price CHECK (order_type = 'market' OR price IS NOT NULL)
+);
+
 -- =====================================================
 -- PERFORMANCE TRACKING
 -- =====================================================
@@ -209,16 +266,19 @@ CREATE TABLE system_health (
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Market data collection health
+-- Market data collection health (updated for cache integration)
 CREATE TABLE data_collection_health (
     id SERIAL PRIMARY KEY,
-    source VARCHAR(50) NOT NULL, -- 'kalshi_api', 'market_cache'
+    component VARCHAR(50) NOT NULL, -- 'market_collector', 'market_cache'
     markets_monitored INTEGER DEFAULT 0,
+    successful_updates INTEGER DEFAULT 0,
+    failed_updates INTEGER DEFAULT 0,
     last_update_time TIMESTAMP,
     update_frequency_seconds INTEGER,
-    error_count INTEGER DEFAULT 0,
-    success_rate DECIMAL(5,2),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    cache_hit_rate DECIMAL(5,2), -- For market_cache component
+    avg_response_time_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- =====================================================
@@ -229,6 +289,7 @@ CREATE TABLE data_collection_health (
 CREATE INDEX idx_market_data_ticker_time ON market_data_history (ticker, timestamp);
 CREATE INDEX idx_market_data_relative_time ON market_data_history (relative_min_to_game_start);
 CREATE INDEX idx_market_data_sport_time ON market_data_history (sport_id, timestamp);
+CREATE INDEX idx_market_data_ticker_recent ON market_data_history (ticker, timestamp DESC);
 
 -- Position indexes
 CREATE INDEX idx_positions_latest ON positions (strategy_id, ticker, position_snapshot_time DESC);
@@ -245,6 +306,13 @@ CREATE INDEX idx_orders_placed_at ON orders (placed_at);
 -- System health indexes
 CREATE INDEX idx_health_component_time ON system_health (component, timestamp);
 CREATE INDEX idx_health_status ON system_health (status);
+
+-- Order request indexes
+CREATE INDEX idx_order_requests_status_priority ON order_requests (status, priority, created_at);
+CREATE INDEX idx_order_requests_strategy_ticker ON order_requests (strategy_id, ticker);
+CREATE INDEX idx_order_requests_pending ON order_requests (status) WHERE status = 'pending';
+CREATE INDEX idx_order_requests_kalshi_id ON order_requests (kalshi_order_id) WHERE kalshi_order_id IS NOT NULL;
+CREATE INDEX idx_order_requests_created ON order_requests (created_at);
 
 -- =====================================================
 -- VIEWS FOR COMMON QUERIES
@@ -375,6 +443,33 @@ BEGIN
     LIMIT 1;
     
     RETURN latest_position;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to submit order request from strategy
+CREATE OR REPLACE FUNCTION submit_order_request(
+    p_strategy_id INTEGER,
+    p_ticker VARCHAR(100),
+    p_side VARCHAR(10),
+    p_action VARCHAR(10),
+    p_order_type VARCHAR(20),
+    p_quantity INTEGER,
+    p_price DECIMAL(4,2),
+    p_strategy_action VARCHAR(50),
+    p_strategy_reason TEXT
+) RETURNS UUID AS $$
+DECLARE
+    request_id UUID;
+BEGIN
+    INSERT INTO order_requests (
+        strategy_id, ticker, side, action, order_type, quantity, price,
+        strategy_action, strategy_reason
+    ) VALUES (
+        p_strategy_id, p_ticker, p_side, p_action, p_order_type, p_quantity, p_price,
+        p_strategy_action, p_strategy_reason
+    ) RETURNING request_uuid INTO request_id;
+    
+    RETURN request_id;
 END;
 $$ LANGUAGE plpgsql;
 
